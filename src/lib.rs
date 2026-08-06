@@ -29,6 +29,9 @@ pub mod queue;
 /// An in-memory flash type that can be used for mocking.
 pub mod mock_flash;
 
+#[cfg(feature = "_test")]
+mod mock_flash_ext;
+
 /// The biggest wordsize we support.
 ///
 /// Stm32 internal flash has 256-bit words, so 32 bytes.
@@ -589,8 +592,8 @@ where
 
 impl<S> core::error::Error for Error<S> where S: core::fmt::Display + core::fmt::Debug {}
 
-// Type representing buffer aligned to 4 byte boundary.
-#[repr(align(4))]
+// Type representing a buffer aligned to the largest supported flash word size.
+#[repr(align(32))]
 pub(crate) struct AlignedBuf<const SIZE: usize>(pub(crate) [u8; SIZE]);
 impl<const SIZE: usize> Deref for AlignedBuf<SIZE> {
     type Target = [u8];

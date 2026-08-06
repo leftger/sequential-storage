@@ -4,6 +4,19 @@
 
 ## Unreleased
 
+- Fixed `SharedRamRing::drain_one` dropping the wrong item when an enqueue with `OverflowPolicy::DiscardOldest`
+  (e.g. from an interrupt) evicted the item being drained while the flash write was in progress.
+  The drained item is now claimed while it's copied out, so only that item can be evicted and
+  items that haven't reached flash yet are never discarded on its behalf.
+- Documented that `SharedRamRing` drain must run in a dedicated Embassy task and must not be
+  cancelled or timed out (`select!` / `with_timeout`), matching the crate's existing cancel model.
+- Fixed the buffered queue treating a too-small `scratch`/`data_buffer` as an empty ring.
+  `drain_one`, `drain_all`, `pop` and `peek` now return `Error::BufferTooSmall` instead of reporting no data.
+- Fixed `queue::find_max_fit` overreporting the free space of an empty page by one item header,
+  which made it suggest sizes that `push` rejects with `ItemTooBig`.
+- Fixed a panic when using a zero-capacity key pointers cache (e.g. `ArrayKeyPointers<_, 0>`).
+- Internal buffers are now aligned to the largest supported flash word size instead of 4 bytes.
+
 ## 8.0.1 - 19-07-26
 
 - Fixed a bug where a canceled map remove item, after a canceled map item store, would in fringe cases allow a map item fetch to return old data

@@ -23,6 +23,12 @@
 //! power loss. Items that have been drained follow the power-fail safety guarantees of
 //! sequential-storage.
 //!
+//! # Cancellation note
+//!
+//! Drain futures are not cancel-safe. Run [`SharedRamRing`] drain in its own Embassy task and
+//! never wrap `drain_*` in `select!` / timeouts; otherwise a cancelled drain can leave an item
+//! both in flash and still in RAM, so the next drain writes it again.
+//!
 //! # Embassy / ISR-safe use
 //!
 //! Enable the `shared-ram-ring` feature for [`SharedRamRing`], which wraps the ring in a
@@ -47,6 +53,29 @@ struct RamRing<const N: usize> {
     /// Total bytes occupied (length prefixes + data).
     used: usize,
     item_count: usize,
+    /// Number of items that have left the front of the ring, wrapping.
+    ///
+    /// This identifies the current oldest item, which lets a drain detect that the item it
+    /// copied out was evicted while the (unlocked) flash write was in progress.
+    dropped_count: u32,
+}
+
+/// Identifies the oldest ring item at the moment it was copied out for a flash write.
+///
+/// See [`RamRing::discard_claimed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DrainClaim {
+    dropped_count: u32,
+}
+
+/// Outcome of [`RamRing::peek_claim`].
+enum RamPeek {
+    /// The ring holds no items.
+    Empty,
+    /// The destination buffer is smaller than the oldest item, which needs this many bytes.
+    BufferTooSmall(usize),
+    /// The oldest item was copied out and is identified by `claim`.
+    Claimed { len: usize, claim: DrainClaim },
 }
 
 impl<const N: usize> RamRing<N> {
@@ -58,6 +87,7 @@ impl<const N: usize> RamRing<N> {
             write_pos: 0,
             used: 0,
             item_count: 0,
+            dropped_count: 0,
         }
     }
 
@@ -140,12 +170,50 @@ impl<const N: usize> RamRing<N> {
         Some(&buf[..len])
     }
 
+    /// Copy the oldest item into `buf` and return a claim that identifies it.
+    ///
+    /// The claim lets the caller write the copied bytes to flash without holding the ring lock
+    /// and afterwards remove exactly that item via [`Self::discard_claimed`].
+    pub fn peek_claim(&self, buf: &mut [u8]) -> RamPeek {
+        let Some(len) = self.oldest_len() else {
+            return RamPeek::Empty;
+        };
+        if buf.len() < len {
+            return RamPeek::BufferTooSmall(len);
+        }
+        let mut pos = (self.read_pos + 2) % N;
+        for b in buf[..len].iter_mut() {
+            *b = self.buf[pos];
+            pos = (pos + 1) % N;
+        }
+        RamPeek::Claimed {
+            len,
+            claim: DrainClaim {
+                dropped_count: self.dropped_count,
+            },
+        }
+    }
+
+    /// Discard the oldest item, but only if it is still the item described by `claim`.
+    ///
+    /// Returns `false` when the claimed item already left the ring, which happens when an
+    /// overwriting push evicted it to make room. The item that took its place has not been
+    /// written to flash yet, so it must be left in the ring to be drained later.
+    pub fn discard_claimed(&mut self, claim: DrainClaim) -> bool {
+        if self.dropped_count != claim.dropped_count {
+            return false;
+        }
+        self.discard_oldest();
+        true
+    }
+
     /// Discard the oldest item without copying it. Does nothing if the ring is empty.
     pub fn discard_oldest(&mut self) {
         if let Some(len) = self.oldest_len() {
             self.read_pos = (self.read_pos + 2 + len) % N;
             self.used -= 2 + len;
             self.item_count -= 1;
+            self.dropped_count = self.dropped_count.wrapping_add(1);
         }
     }
 
@@ -245,17 +313,20 @@ impl<S: NorFlash, C: CacheImpl<()>, const RAM_BYTES: usize> BufferedQueue<S, C, 
     /// oldest pending item.
     ///
     /// Returns `Ok(true)` if an item was committed to flash, `Ok(false)` if the ring was empty.
+    /// Returns [`Error::BufferTooSmall`] if `scratch` is smaller than the oldest pending item.
     pub async fn drain_one(
         &mut self,
         scratch: &mut [u8],
         allow_overwrite: bool,
     ) -> Result<bool, Error<S::Error>> {
-        let Some(data) = self.ram.peek_into(scratch) else {
-            return Ok(false);
+        let (len, claim) = match self.ram.peek_claim(scratch) {
+            RamPeek::Empty => return Ok(false),
+            RamPeek::BufferTooSmall(needed) => return Err(Error::BufferTooSmall(needed)),
+            RamPeek::Claimed { len, claim } => (len, claim),
         };
-        let len = data.len();
         self.storage.push(&scratch[..len], allow_overwrite).await?;
-        self.ram.discard_oldest();
+        // The claim always matches here because `&mut self` rules out a concurrent enqueue.
+        self.ram.discard_claimed(claim);
         Ok(true)
     }
 
@@ -275,6 +346,9 @@ impl<S: NorFlash, C: CacheImpl<()>, const RAM_BYTES: usize> BufferedQueue<S, C, 
     ///
     /// Flash items are always older than RAM items, so flash is read first. If flash is
     /// empty the oldest item is taken directly from the RAM ring without writing to flash.
+    ///
+    /// Returns [`Error::BufferTooSmall`] if `data_buffer` is smaller than the oldest RAM item
+    /// (when flash is empty).
     pub async fn pop<'d>(
         &mut self,
         data_buffer: &'d mut [u8],
@@ -287,18 +361,24 @@ impl<S: NorFlash, C: CacheImpl<()>, const RAM_BYTES: usize> BufferedQueue<S, C, 
         if let Some(len) = flash_len {
             return Ok(Some(&mut data_buffer[..len]));
         }
-        let len = self.ram.peek_into(data_buffer).map(|s| s.len());
-        if let Some(len) = len {
-            self.ram.discard_oldest();
-            return Ok(Some(&mut data_buffer[..len]));
+        let Some(needed) = self.ram.oldest_len() else {
+            return Ok(None);
+        };
+        if data_buffer.len() < needed {
+            return Err(Error::BufferTooSmall(needed));
         }
-        Ok(None)
+        let len = self.ram.peek_into(data_buffer).unwrap().len();
+        self.ram.discard_oldest();
+        Ok(Some(&mut data_buffer[..len]))
     }
 
     /// Peek at the oldest item without removing it.
     ///
     /// Flash items are always older than RAM items, so flash is read first. If flash is
     /// empty the oldest item is read directly from the RAM ring without writing to flash.
+    ///
+    /// Returns [`Error::BufferTooSmall`] if `data_buffer` is smaller than the oldest RAM item
+    /// (when flash is empty).
     pub async fn peek<'d>(
         &mut self,
         data_buffer: &'d mut [u8],
@@ -311,11 +391,14 @@ impl<S: NorFlash, C: CacheImpl<()>, const RAM_BYTES: usize> BufferedQueue<S, C, 
         if let Some(len) = flash_len {
             return Ok(Some(&mut data_buffer[..len]));
         }
-        let len = self.ram.peek_into(data_buffer).map(|s| s.len());
-        if let Some(len) = len {
-            return Ok(Some(&mut data_buffer[..len]));
+        let Some(needed) = self.ram.oldest_len() else {
+            return Ok(None);
+        };
+        if data_buffer.len() < needed {
+            return Err(Error::BufferTooSmall(needed));
         }
-        Ok(None)
+        let len = self.ram.peek_into(data_buffer).unwrap().len();
+        Ok(Some(&mut data_buffer[..len]))
     }
 
     /// Total capacity of the RAM ring in bytes (including 2-byte per-item length prefixes).
@@ -361,6 +444,20 @@ impl<S: NorFlash, C: CacheImpl<()>, const RAM_BYTES: usize> BufferedQueue<S, C, 
 /// for task context; they take a `&mut QueueStorage` so flash access remains exclusive to
 /// one task.
 ///
+/// Enqueueing with [`OverflowPolicy::DiscardOldest`] while a drain is writing to flash may
+/// evict the item being drained. Only that item is lost; items that have not been written to
+/// flash yet are never dropped on its behalf.
+///
+/// ## Cancellation / timeouts
+///
+/// Like the rest of this crate, drain futures are **not cancel-safe**. If a `drain_*` future
+/// is cancelled after the flash write has landed but before the item is removed from the ring,
+/// the next drain will write it again (at-least-once). Power loss does not produce this
+/// duplicate: RAM is wiped on reset.
+///
+/// Run drain in its **own Embassy task** and await it to completion. Do **not** wrap
+/// `drain_one` / `drain_all` / `wait_and_drain_all` in `select!`, `with_timeout`, or similar.
+///
 /// ## Typical wiring
 ///
 /// ```ignore
@@ -369,9 +466,9 @@ impl<S: NorFlash, C: CacheImpl<()>, const RAM_BYTES: usize> BufferedQueue<S, C, 
 /// // In an interrupt handler (or anywhere, no async needed):
 /// RING.enqueue(&sensor_sample, OverflowPolicy::DiscardOldest);
 ///
-/// // In the drain task:
+/// // Dedicated drain task — never cancel or timeout these awaits:
 /// #[embassy_executor::task]
-/// async fn drain(mut storage: QueueStorage<Flash, NoCache>) {
+/// async fn drain(mut storage: QueueStorage<Flash, _>) {
 ///     let mut scratch = [0u8; 64];
 ///     loop {
 ///         RING.wait_and_drain_all(&mut storage, &mut scratch, false).await.unwrap();
@@ -431,23 +528,28 @@ impl<const N: usize> SharedRamRing<N> {
     ///
     /// `scratch` must be at least [`oldest_ram_item_len`][Self::oldest_ram_item_len] bytes.
     /// Returns `Ok(true)` if an item was written, `Ok(false)` if the ring was empty.
+    /// Returns [`Error::BufferTooSmall`] if `scratch` is smaller than the oldest pending item.
     ///
     /// The critical section is held only for the brief ring peek/discard; the slow flash
-    /// write runs outside it.
+    /// write runs outside it. The item is claimed while copying it out, so a concurrent
+    /// [`OverflowPolicy::DiscardOldest`] enqueue that evicts it cannot cause a different,
+    /// not-yet-written item to be dropped from the ring.
+    ///
+    /// **Not cancel-safe.** Prefer a dedicated drain task that always awaits this future to
+    /// completion (see [`SharedRamRing`]). Do not use `select!` / timeouts on drain.
     pub async fn drain_one<S: NorFlash, C: CacheImpl<()>>(
         &self,
         storage: &mut QueueStorage<S, C>,
         scratch: &mut [u8],
         allow_overwrite: bool,
     ) -> Result<bool, Error<S::Error>> {
-        let len = self
-            .ring
-            .lock(|r| r.borrow().peek_into(scratch).map(|s| s.len()));
-        let Some(len) = len else {
-            return Ok(false);
+        let (len, claim) = match self.ring.lock(|r| r.borrow().peek_claim(scratch)) {
+            RamPeek::Empty => return Ok(false),
+            RamPeek::BufferTooSmall(needed) => return Err(Error::BufferTooSmall(needed)),
+            RamPeek::Claimed { len, claim } => (len, claim),
         };
         storage.push(&scratch[..len], allow_overwrite).await?;
-        self.ring.lock(|r| r.borrow_mut().discard_oldest());
+        self.ring.lock(|r| r.borrow_mut().discard_claimed(claim));
         Ok(true)
     }
 
@@ -466,7 +568,8 @@ impl<const N: usize> SharedRamRing<N> {
 
     /// Wait for the signal, then drain all ring items to flash.
     ///
-    /// This is the recommended drain-task body:
+    /// This is the recommended body of a **dedicated** drain task. Await it to completion;
+    /// do not cancel or timeout it (see [`SharedRamRing`]):
     /// ```ignore
     /// loop {
     ///     ring.wait_and_drain_all(&mut storage, &mut scratch, false).await.unwrap();
@@ -603,26 +706,84 @@ mod tests {
         assert_eq!(ring.peek_into(&mut buf), Some(b"ccc".as_ref()));
     }
 
+    #[test]
+    fn claim_discards_the_claimed_item() {
+        let mut ring = RamRing::<32>::new();
+        ring.push(b"aaa").unwrap();
+        ring.push(b"bbb").unwrap();
+
+        let mut buf = [0u8; 8];
+        let RamPeek::Claimed { len, claim } = ring.peek_claim(&mut buf) else {
+            panic!("expected a claim");
+        };
+        assert_eq!(&buf[..len], b"aaa");
+
+        assert!(ring.discard_claimed(claim));
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.peek_into(&mut buf), Some(b"bbb".as_ref()));
+    }
+
+    #[test]
+    fn claim_is_rejected_after_the_item_was_evicted() {
+        // 12 bytes holds exactly two 3-byte items (2-byte prefix each).
+        let mut ring = RamRing::<12>::new();
+        ring.push(b"aaa").unwrap();
+        ring.push(b"bbb").unwrap();
+
+        let mut buf = [0u8; 8];
+        let RamPeek::Claimed { len, claim } = ring.peek_claim(&mut buf) else {
+            panic!("expected a claim");
+        };
+        assert_eq!(&buf[..len], b"aaa");
+
+        // Simulates an ISR enqueue during the flash write: the ring is full, so "aaa" (the
+        // item being drained) is evicted to make room for "ccc".
+        ring.push_overwriting(b"ccc").unwrap();
+
+        // The claimed item is already gone, so nothing more may be discarded. Dropping "bbb"
+        // here would lose an item that was never written to flash.
+        assert!(!ring.discard_claimed(claim));
+        assert_eq!(ring.len(), 2);
+        assert_eq!(ring.peek_into(&mut buf), Some(b"bbb".as_ref()));
+        ring.discard_oldest();
+        assert_eq!(ring.peek_into(&mut buf), Some(b"ccc".as_ref()));
+    }
+
+    #[test]
+    fn claim_reports_buffer_too_small() {
+        let mut ring = RamRing::<32>::new();
+        ring.push(b"aaaa").unwrap();
+
+        let mut buf = [0u8; 2];
+        assert!(matches!(
+            ring.peek_claim(&mut buf),
+            RamPeek::BufferTooSmall(4)
+        ));
+        assert_eq!(ring.len(), 1);
+    }
+
     // ── Integration tests (require mock flash via _test feature) ─────────────
 
     #[cfg(feature = "_test")]
     mod integration {
         use super::*;
-        use crate::cache::Uncached;
+        use crate::cache::Cache;
         use crate::mock_flash::MockFlashBase;
         use crate::queue::{QueueConfig, QueueStorage};
         use futures::executor::block_on;
 
         // 4 pages × 64 words × 4 bytes/word = 1 KiB flash
         type MockFlash = MockFlashBase<4, 4, 64>;
+        type UncachedCache =
+            Cache<crate::cache::Uncached, crate::cache::Uncached, crate::cache::Uncached>;
 
-        fn make_storage() -> QueueStorage<MockFlash, NoCache> {
+        fn make_storage() -> QueueStorage<MockFlash, UncachedCache> {
             let flash = MockFlash::new(crate::mock_flash::WriteCountCheck::Twice, None, true);
             let config = QueueConfig::new(MockFlash::FULL_FLASH_RANGE);
-            QueueStorage::new(flash, config, NoCache::new())
+            QueueStorage::new(flash, config, Cache::new_uncached())
         }
 
-        fn make_queue() -> BufferedQueue<MockFlash, NoCache, 256> {
+        fn make_queue() -> BufferedQueue<MockFlash, UncachedCache, 256> {
             BufferedQueue::new(make_storage())
         }
 
@@ -663,7 +824,8 @@ mod tests {
                 aligned[..5].copy_from_slice(b"first");
                 storage.push(&aligned[..5], false).await.unwrap();
 
-                let mut queue: BufferedQueue<MockFlash, NoCache, 256> = BufferedQueue::new(storage);
+                let mut queue: BufferedQueue<MockFlash, UncachedCache, 256> =
+                    BufferedQueue::new(storage);
                 let mut out = [0u8; 64];
 
                 // Buffer "second" in RAM only.
@@ -686,8 +848,9 @@ mod tests {
             // 3 items of 4 bytes = 3*6 = 18 bytes — won't all fit.
             let flash = MockFlash::new(crate::mock_flash::WriteCountCheck::Twice, None, true);
             let config = QueueConfig::new(MockFlash::FULL_FLASH_RANGE);
-            let storage = QueueStorage::new(flash, config, NoCache::new());
-            let mut queue: BufferedQueue<MockFlash, NoCache, 16> = BufferedQueue::new(storage);
+            let storage = QueueStorage::new(flash, config, Cache::new_uncached());
+            let mut queue: BufferedQueue<MockFlash, UncachedCache, 16> =
+                BufferedQueue::new(storage);
 
             queue.enqueue(b"aaaa", OverflowPolicy::Err).unwrap(); // 6 bytes used
             queue.enqueue(b"bbbb", OverflowPolicy::Err).unwrap(); // 12 bytes used
@@ -698,8 +861,9 @@ mod tests {
         fn overflow_policy_discard_oldest() {
             let flash = MockFlash::new(crate::mock_flash::WriteCountCheck::Twice, None, true);
             let config = QueueConfig::new(MockFlash::FULL_FLASH_RANGE);
-            let storage = QueueStorage::new(flash, config, NoCache::new());
-            let mut queue: BufferedQueue<MockFlash, NoCache, 16> = BufferedQueue::new(storage);
+            let storage = QueueStorage::new(flash, config, Cache::new_uncached());
+            let mut queue: BufferedQueue<MockFlash, UncachedCache, 16> =
+                BufferedQueue::new(storage);
 
             queue.enqueue(b"aaaa", OverflowPolicy::Err).unwrap();
             queue.enqueue(b"bbbb", OverflowPolicy::Err).unwrap();
@@ -724,11 +888,128 @@ mod tests {
         fn capacity_helpers() {
             let queue = make_queue();
             assert_eq!(
-                BufferedQueue::<MockFlash, NoCache, 256>::ram_capacity_bytes(),
+                BufferedQueue::<MockFlash, UncachedCache, 256>::ram_capacity_bytes(),
                 256
             );
             assert_eq!(queue.ram_free_bytes(), 256);
             assert_eq!(queue.ram_bytes_used(), 0);
+        }
+
+        #[test]
+        fn drain_undersized_scratch_is_buffer_too_small() {
+            block_on(async {
+                let mut queue = make_queue();
+                queue.enqueue(b"hello", OverflowPolicy::Err).unwrap();
+
+                let mut scratch = [0u8; 2];
+                assert_eq!(
+                    queue.drain_one(&mut scratch, false).await,
+                    Err(Error::BufferTooSmall(5))
+                );
+                assert_eq!(queue.ram_pending_count(), 1);
+            });
+        }
+    }
+
+    // ── SharedRamRing concurrency (needs mock flash and embassy-sync) ─────────
+
+    #[cfg(all(feature = "_test", feature = "shared-ram-ring"))]
+    mod shared_ring {
+        use super::*;
+        use crate::AlignedBuf;
+        use crate::cache::Cache;
+        use crate::mock_flash::{MockFlashBase, MockFlashError, WriteCountCheck};
+        use crate::queue::{QueueConfig, QueueStorage};
+        use embedded_storage_async::nor_flash::{ErrorType, ReadNorFlash};
+        use futures::executor::block_on;
+
+        type MockFlash = MockFlashBase<4, 4, 64>;
+
+        /// Holds exactly two 4-byte items (each costs a 2-byte prefix + 4 bytes of data).
+        static RING: SharedRamRing<12> = SharedRamRing::new();
+
+        /// Flash that simulates an interrupt firing in the middle of a drain's flash write.
+        ///
+        /// On the first write it enqueues into [`RING`] with [`OverflowPolicy::DiscardOldest`].
+        /// The ring is full at that point, so this evicts the very item being drained.
+        struct InterruptingFlash {
+            inner: MockFlash,
+            interrupted: bool,
+        }
+
+        impl ErrorType for InterruptingFlash {
+            type Error = MockFlashError;
+        }
+
+        impl ReadNorFlash for InterruptingFlash {
+            const READ_SIZE: usize = <MockFlash as ReadNorFlash>::READ_SIZE;
+
+            async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
+                self.inner.read(offset, bytes).await
+            }
+
+            fn capacity(&self) -> usize {
+                self.inner.capacity()
+            }
+        }
+
+        impl NorFlash for InterruptingFlash {
+            const WRITE_SIZE: usize = <MockFlash as NorFlash>::WRITE_SIZE;
+            const ERASE_SIZE: usize = <MockFlash as NorFlash>::ERASE_SIZE;
+
+            async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
+                self.inner.erase(from, to).await
+            }
+
+            async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
+                if !self.interrupted {
+                    self.interrupted = true;
+                    RING.enqueue(b"cccc", OverflowPolicy::DiscardOldest)
+                        .unwrap();
+                }
+                self.inner.write(offset, bytes).await
+            }
+        }
+
+        impl MultiwriteNorFlash for InterruptingFlash {}
+
+        #[test]
+        fn concurrent_eviction_does_not_drop_an_undrained_item() {
+            block_on(async {
+                RING.enqueue(b"aaaa", OverflowPolicy::Err).unwrap();
+                RING.enqueue(b"bbbb", OverflowPolicy::Err).unwrap();
+                assert_eq!(RING.ram_pending_count(), 2);
+
+                let flash = InterruptingFlash {
+                    inner: MockFlash::new(WriteCountCheck::Twice, None, true),
+                    interrupted: false,
+                };
+                let mut storage = QueueStorage::new(
+                    flash,
+                    QueueConfig::new(MockFlash::FULL_FLASH_RANGE),
+                    Cache::new_uncached(),
+                );
+                let mut scratch = AlignedBuf([0u8; 32]);
+
+                // Drains "aaaa". Mid-write the "interrupt" enqueues "cccc", evicting "aaaa"
+                // from the ring. "bbbb" has not been written yet and must survive.
+                assert!(
+                    RING.drain_one(&mut storage, &mut scratch, false)
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(RING.ram_pending_count(), 2);
+
+                RING.drain_all(&mut storage, &mut scratch, false)
+                    .await
+                    .unwrap();
+
+                let mut out = AlignedBuf([0u8; 32]);
+                assert_eq!(storage.pop(&mut out).await.unwrap().unwrap(), b"aaaa");
+                assert_eq!(storage.pop(&mut out).await.unwrap().unwrap(), b"bbbb");
+                assert_eq!(storage.pop(&mut out).await.unwrap().unwrap(), b"cccc");
+                assert!(storage.pop(&mut out).await.unwrap().is_none());
+            });
         }
     }
 }

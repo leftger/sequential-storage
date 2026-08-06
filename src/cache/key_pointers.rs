@@ -131,6 +131,10 @@ pub(crate) struct TrackedKeyPointers<'a, KEY: Eq> {
 impl<'a, KEY: Eq> TrackedKeyPointers<'a, KEY> {
     fn insert_front(&mut self, value: (KEY, NonZeroU32)) {
         let len = self.key_pointers.len();
+        // Zero-capacity caches (e.g. ArrayKeyPointers<_, 0>) are a no-op.
+        if len == 0 {
+            return;
+        }
         self.key_pointers[len - 1] = Some(value);
         move_to_front(self.key_pointers, len - 1);
     }
@@ -204,6 +208,15 @@ fn move_to_back<T>(data: &mut [Option<T>], index: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_capacity_key_pointers_is_noop() {
+        let mut cache = ArrayKeyPointers::<u8, 0>::new();
+        cache.notice_key_location(&42, 100);
+        assert_eq!(cache.key_location(&42), None);
+        cache.notice_key_erased(&42);
+        assert_eq!(cache.key_location(&42), None);
+    }
 
     #[test]
     fn test_move_to_front() {

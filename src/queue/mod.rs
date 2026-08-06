@@ -30,7 +30,7 @@ impl<S: NorFlash> QueueConfig<S> {
         }
     }
 
-    /// Create a new queue configuration. Will return None if the data is invalid
+    /// Create a new queue configuration. Will return an error if the data is invalid.
     pub const fn try_new(flash_range: Range<u32>) -> Result<Self, QueueConfigError> {
         if !flash_range.start.is_multiple_of(S::ERASE_SIZE as u32) {
             return Err(QueueConfigError::StartRangeNotAtPageBoundary);
@@ -359,12 +359,16 @@ impl<S: NorFlash, C: CacheImpl<()>> QueueStorage<S, C> {
             state @ PageState::Closed => {
                 if self.inner.is_page_empty(next_page, Some(state)).await? {
                     self.inner.cache.unmark_dirty();
-                    return Ok(Some((S::ERASE_SIZE - (2 * S::WORD_SIZE)) as u32));
+                    return Ok(ItemHeader::available_data_bytes::<S>(
+                        (S::ERASE_SIZE - (2 * S::WORD_SIZE)) as u32,
+                    ));
                 }
             }
             PageState::Open => {
                 self.inner.cache.unmark_dirty();
-                return Ok(Some((S::ERASE_SIZE - (2 * S::WORD_SIZE)) as u32));
+                return Ok(ItemHeader::available_data_bytes::<S>(
+                    (S::ERASE_SIZE - (2 * S::WORD_SIZE)) as u32,
+                ));
             }
             PageState::PartialOpen => {
                 // This should never happen
@@ -1365,6 +1369,34 @@ mod tests {
         assert_eq!(
             storage
                 .push(&AlignedBuf([0; 1024 - 4 * 2 - 8 + 1]), false,)
+                .await,
+            Err(Error::ItemTooBig)
+        );
+    }
+
+    #[test]
+    async fn find_max_fit_empty_page_accounts_for_header() {
+        // On an empty queue the next page is Open; find_max_fit must report the max
+        // pushable payload (page data region minus item header), not the raw region size.
+        let mut storage = QueueStorage::new(
+            MockFlashBig::new(WriteCountCheck::Twice, None, true),
+            const { QueueConfig::new(0x000..0x1000) },
+            Cache::new_uncached(),
+        );
+
+        // Page = 1024 bytes, 2×4-byte markers, 8-byte item header → max payload 1008.
+        // The old bug returned 1016 (raw data region), which push rejects as ItemTooBig.
+        let expected = (1024 - 4 * 2 - 8) as u32;
+        assert_eq!(storage.find_max_fit().await.unwrap(), Some(expected));
+
+        storage
+            .push(&AlignedBuf([0; 1024])[..expected as usize], false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .push(&AlignedBuf([0; 1024])[..(expected as usize + 1)], false)
                 .await,
             Err(Error::ItemTooBig)
         );

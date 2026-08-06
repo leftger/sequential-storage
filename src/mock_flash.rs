@@ -118,59 +118,6 @@ impl<const PAGES: usize, const BYTES_PER_WORD: usize, const PAGE_WORDS: usize>
     pub fn stats_snapshot(&self) -> FlashStatsSnapshot {
         self.current_stats
     }
-
-    #[cfg(any(test, feature = "_test"))]
-    /// Get the presence of the item at the given address.
-    ///
-    /// - If some, the item is there.
-    /// - If true, the item is present and fine.
-    /// - If false, the item is corrupt or erased.
-    pub async fn get_item_presence(&mut self, target_item_address: u32) -> Option<bool> {
-        use crate::NorFlashExt;
-
-        if !Self::FULL_FLASH_RANGE.contains(&target_item_address) {
-            return None;
-        }
-
-        let mut buf = [0; 1024 * 16];
-
-        let page_index =
-            crate::calculate_page_index::<Self>(Self::FULL_FLASH_RANGE, target_item_address);
-
-        let page_data_start =
-            crate::calculate_page_address::<Self>(Self::FULL_FLASH_RANGE, page_index)
-                + Self::WORD_SIZE as u32;
-        let page_data_end =
-            crate::calculate_page_end_address::<Self>(Self::FULL_FLASH_RANGE, page_index)
-                - Self::WORD_SIZE as u32;
-
-        let mut found_item = None;
-        let mut it = crate::item::ItemHeaderIter::new(page_data_start, page_data_end);
-        while let (Some(header), item_address) = it.traverse(self, |_, _| false).await.unwrap() {
-            let next_item_address = header.next_item_address::<Self>(item_address);
-
-            if (item_address..next_item_address).contains(&target_item_address) {
-                let maybe_item = header
-                    .read_item(self, &mut buf, item_address, page_data_end)
-                    .await
-                    .unwrap();
-
-                match maybe_item {
-                    crate::item::MaybeItem::Corrupted(_, _)
-                    | crate::item::MaybeItem::Erased(_, _) => {
-                        found_item.replace(false);
-                        break;
-                    }
-                    crate::item::MaybeItem::Present(_) => {
-                        found_item.replace(true);
-                        break;
-                    }
-                }
-            }
-        }
-
-        found_item
-    }
 }
 
 impl<const PAGES: usize, const BYTES_PER_WORD: usize, const PAGE_WORDS: usize> ErrorType
